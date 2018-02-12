@@ -15,7 +15,7 @@ type Locker struct {
 	once     sync.Once
 	broker   *amqp.Connection
 	closed   chan *amqp.Error
-	requests chan chan<- *amqp.Connection
+	requests chan chan<- response
 }
 
 // Do calls fn while holding a lock on the resource named r.
@@ -28,7 +28,7 @@ type Locker struct {
 func (l *Locker) Do(ctx context.Context, r string, fn func(c context.Context)) error {
 	l.once.Do(l.init)
 
-	reply := make(chan *amqp.Connection, 1)
+	reply := make(chan response, 1)
 
 	select {
 	case <-ctx.Done():
@@ -39,15 +39,25 @@ func (l *Locker) Do(ctx context.Context, r string, fn func(c context.Context)) e
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case broker := <-reply:
+	case rsp := <-reply:
+		if rsp.err != nil {
+			return rsp.err
+		}
+
 		m := &fsm{
-			broker: broker,
+			broker: rsp.broker,
 			ctx:    ctx,
 			res:    r,
 			fn:     fn,
 		}
+
 		return m.run()
 	}
+}
+
+type response struct {
+	broker *amqp.Connection
+	err    error
 }
 
 // Run starts the locker, which mantains a persistent connection to the AMQP
@@ -55,13 +65,19 @@ func (l *Locker) Do(ctx context.Context, r string, fn func(c context.Context)) e
 func (l *Locker) Run(ctx context.Context) error {
 	l.once.Do(l.init)
 
+	defer func() {
+		if l.broker != nil {
+			l.broker.Close()
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case reply := <-l.requests:
-			l.dial(ctx)
-			reply <- l.broker // reply queue is buffered
+			err := l.dial(ctx)
+			reply <- response{l.broker, err} // reply queue is buffered
 		case err := <-l.closed:
 			fmt.Println(err)
 		}
@@ -69,14 +85,14 @@ func (l *Locker) Run(ctx context.Context) error {
 }
 
 func (l *Locker) init() {
-	l.requests = make(chan chan<- *amqp.Connection)
+	l.requests = make(chan chan<- response)
 }
 
-func (l *Locker) dial(ctx context.Context) {
+func (l *Locker) dial(ctx context.Context) error {
 	fmt.Println("DIALING")
 
 	if l.broker != nil {
-		return
+		return nil
 	}
 
 	dsn := l.DSN
@@ -86,11 +102,12 @@ func (l *Locker) dial(ctx context.Context) {
 
 	broker, err := amqp.Dial(dsn) // TODO: ctx dialer
 	if err != nil {
-		fmt.Println(err)
-		return
+		return err
 	}
 
 	l.closed = make(chan *amqp.Error)
 	broker.NotifyClose(l.closed)
 	l.broker = broker
+
+	return nil
 }
