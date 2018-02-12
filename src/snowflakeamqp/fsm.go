@@ -275,9 +275,6 @@ func (m *fsm) consume() error {
 		false, // noWait bool
 		nil,   // args
 	)
-	if err != nil {
-		return err
-	}
 
 	return err
 }
