@@ -133,12 +133,18 @@ func (m *fsm) invoke() (state, error) {
 	fmt.Println("ENTER STATE: invoke")
 
 	ctx, cancel := context.WithCancel(m.ctx)
-	defer cancel()
-
 	done := make(chan struct{})
+
+	// run the work function in its own goroutine
 	go func() {
 		defer close(done)
 		m.fn(ctx)
+	}()
+
+	// always wait for fn to return before transitioning state
+	defer func() {
+		cancel()
+		<-done
 	}()
 
 	for {

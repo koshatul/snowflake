@@ -8,10 +8,10 @@ import (
 type Locker interface {
 	// Do calls fn while holding a lock on the resource named r.
 	//
-	// It blocks until the lock is acquired and fn returns, or until ctx is
-	// canceled.
+	// It blocks until the lock is acquired or ctx is canceled. Once the lock
+	// has been acquired fn is called with c, a context derived from c.
 	//
-	// c, the context passed to fn, is derived from ctx. If the lock is 'lost'
-	// before fn returns, c is canceled.
+	// If the lock is released while fn is executing, c is canceled. Once fn has
+	// been called, Do() always blocks until fn returns.
 	Do(ctx context.Context, r string, fn func(c context.Context)) error
 }
