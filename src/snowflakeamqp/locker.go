@@ -79,7 +79,8 @@ func (l *Locker) Run(ctx context.Context) error {
 			err := l.dial(ctx)
 			reply <- response{l.broker, err} // reply queue is buffered
 		case err := <-l.closed:
-			fmt.Println(err)
+			// TODO: log
+			fmt.Println("unable to dial broker:", err)
 		}
 	}
 }
@@ -89,8 +90,6 @@ func (l *Locker) init() {
 }
 
 func (l *Locker) dial(ctx context.Context) error {
-	fmt.Println("DIALING")
-
 	if l.broker != nil {
 		return nil
 	}

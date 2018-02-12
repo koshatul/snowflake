@@ -2,7 +2,6 @@ package snowflakeamqp
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/streadway/amqp"
 )
@@ -54,8 +53,6 @@ func (m *fsm) run() error {
 
 // wait is a state that waits for an "availability" token to be delivered.
 func (m *fsm) wait() (state, error) {
-	fmt.Println("ENTER STATE: wait")
-
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -81,8 +78,6 @@ func (m *fsm) wait() (state, error) {
 // acquire is a state that attempts to start an exclusive consumer on the
 // on the lock queue. It assumes a token
 func (m *fsm) acquire() (state, error) {
-	fmt.Println("ENTER STATE: acquire")
-
 	if m.token == nil {
 		panic("the acquire state requires that a token has been received")
 	}
@@ -130,8 +125,6 @@ func (m *fsm) acquire() (state, error) {
 
 // invoke is a state that invokes the work function.
 func (m *fsm) invoke() (state, error) {
-	fmt.Println("ENTER STATE: invoke")
-
 	ctx, cancel := context.WithCancel(m.ctx)
 	done := make(chan struct{})
 
@@ -154,8 +147,6 @@ func (m *fsm) invoke() (state, error) {
 
 		case tok, ok := <-m.tokens:
 			if ok {
-				fmt.Println("IGNORED EXTRA TOKEN")
-
 				// Any additional tokens we receive must be duplicates as we're
 				// already holding the token that granted us the lock in m.token.
 				if err := tok.Ack(false); err != nil { // false = single message
@@ -212,8 +203,6 @@ func (m *fsm) declare() error {
 	// *MIGHT* be the first locker interested in this resource, publish a new
 	// token message. Again, this just prevents some unnecessary network traffic.
 	if q.Consumers == 0 && q.Messages == 0 {
-		fmt.Println("PUBLISH TOKEN")
-
 		err = m.tc.Publish(
 			"",
 			m.res+".tokens",
