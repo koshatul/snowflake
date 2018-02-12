@@ -4,94 +4,142 @@ import (
 	"context"
 
 	"github.com/streadway/amqp"
+	"github.com/uber-go/multierr"
 )
 
 type state func() (state, error)
 
 type fsm struct {
+	// broker is the AMQP broker connection used to establish new AMQP channels
 	broker *amqp.Connection
-	ctx    context.Context
-	res    string
-	fn     func(context.Context)
 
-	lc, tc *amqp.Channel
-	done   chan *amqp.Error
+	// ctx is the context that was passed to Locker.Do().
+	// Lock acquisition is aborted if ctx is canceled.
+	ctx context.Context
+
+	// res is the name of the resource being locked.
+	res string
+
+	// fn is the "work function" to be executed when the lock is acquired.
+	fn func(context.Context)
+
+	// channel is the AMQP channel used to consume "tokens" which indicate the
+	// availability of the resource.
+	channel *amqp.Channel
+
+	// closed is closed when channel is closed.
+	closed chan *amqp.Error
+
+	// tokens is the channel on which incoming token messages are delivered.
 	tokens <-chan amqp.Delivery
-	token  *amqp.Delivery
+
+	// token is the token message which is held for the duration of the lock.
+	// It is never acknowledged, allowing it to be redelivered to another
+	// consumer when fn() panics or returns.
+	token *amqp.Delivery
+
+	// lockChannel is the AMQP channel that is the exclusive consumer of the
+	// locking queue. It may be nil if the lock was never acquired.
+	lockChannel *amqp.Channel
 }
 
-func (m *fsm) run() error {
-	c, err := m.broker.Channel()
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-
-	m.tc = c
-
-	err = m.declare()
-	if err != nil {
-		return err
-	}
-
-	m.done = make(chan *amqp.Error, 1)
-	m.tc.NotifyClose(m.done)
-
+// execute runs the state machine.
+func (m *fsm) execute() (err error) {
 	defer func() {
-		if m.lc != nil {
-			m.lc.Close()
-		}
+		err = m.shutdown(err)
 	}()
+
+	m.channel, err = m.broker.Channel()
+	if err != nil {
+		return
+	}
+
+	m.closed = make(chan *amqp.Error, 1)
+	m.channel.NotifyClose(m.closed)
+
+	err = m.consume()
+	if err != nil {
+		return
+	}
 
 	state := m.wait
 	for state != nil && err == nil {
 		state, err = state()
 	}
 
+	return
+}
+
+// shutdown is called when the state machine stops executing.
+// It is passed the error from the last executed state, which may be nil.
+func (m *fsm) shutdown(err error) error {
+	if m.channel != nil {
+		err = multierr.Append(
+			err,
+			m.channel.Close(),
+		)
+	}
+
+	if m.lockChannel != nil {
+		err = multierr.Append(
+			err,
+			m.lockChannel.Close(),
+		)
+	}
+
 	return err
 }
 
-// wait is a state that waits for an "availability" token to be delivered.
+// wait is the initial state. It waits for an "availability token" to be
+// delivered then transitions to the m.acquire state.
 func (m *fsm) wait() (state, error) {
-	for {
-		select {
-		case <-m.ctx.Done():
-			return nil, m.ctx.Err()
+	select {
+	case <-m.ctx.Done():
+		// If the context is canceled before we acquire the lock, we simply
+		// shutdown.
+		return nil, m.ctx.Err()
 
-		case tok, ok := <-m.tokens:
-			if ok {
-				m.token = &tok
-				return m.acquire, nil
-			}
-
-			// If m.tokens is closed before m.closed becomes readable
-			// we don't want to attempt to read from it anymore, just wait
-			// for the error to appear or the context to be canceled.
-			m.tokens = nil
-
-		case err := <-m.done:
-			return nil, err
+	case tok, ok := <-m.tokens:
+		if !ok {
+			// m.tokens is closed which means the consumer has stopped.
+			// This is always unexpected and so must be caused by the
+			// channel closing.
+			return m.waitClose, nil
 		}
+
+		// If we receive a token, it's highly likely that the resource has
+		// become available.
+		m.token = &tok
+		return m.acquire, nil
 	}
 }
 
 // acquire is a state that attempts to start an exclusive consumer on the
-// on the lock queue. It assumes a token
+// on the lock queue. It expects that m.token points to a valid unacknowledged
+// token message.
 func (m *fsm) acquire() (state, error) {
-	if m.token == nil {
-		panic("the acquire state requires that a token has been received")
-	}
-
 	c, err := m.broker.Channel()
 	if err != nil {
 		return nil, err
 	}
 
+	queue := lockQueue(m.res)
+	_, err = c.QueueDeclare(
+		queue,
+		false, // durable,
+		true,  // auto-delete
+		false, // exclusive
+		false, // no-wait
+		nil,   // args
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// Attempt to start an exclusive consumer on the lock channel.
-	// There should never be any messages delivered to this channel, but
-	// noAck = true discards any that may be delivered here manually.
+	// There should never be any messages delivered to this queue.
 	_, err = c.Consume(
-		m.res+".lock",
+		queue,
 		m.res,
 		true,  // autoAck
 		true,  // exclusive
@@ -100,31 +148,31 @@ func (m *fsm) acquire() (state, error) {
 		nil,   // args
 	)
 
-	// The consumer started successfully, we now hold the lock and can invoke
-	// the work function.
-	if err == nil {
-		m.lc = c
-		return m.invoke, nil
-	}
-
-	// If the error is an AMQP "resource locked" exception, that means another
-	// consumer already has exclusive access to the lock queue. This could be
-	// just be a timing issue, or related to multiple tokens being delivered.
-	// Either way, we simply return the token to the queue and try again.
-	if amqpErr, ok := err.(*amqp.Error); ok {
-		if amqpErr.Code == amqp.ResourceLocked {
-			err = m.token.Reject(true) // true = requeue
-			if err == nil {
-				return m.wait, nil
+	if err != nil {
+		if amqpErr, ok := err.(*amqp.Error); ok {
+			if amqpErr.Code == amqp.ResourceLocked {
+				// If the error is an AMQP "resource locked" exception, that
+				// means another consumer already has exclusive access to the
+				// lock queue. This could be because multiple tokens have been
+				// published to the token queue, which can occur when two
+				// competing machines start consuming at the same time.
+				//
+				// Go back to waiting if we can cleanly return the token to the
+				// queue.
+				return m.wait, m.token.Reject(true)
 			}
 		}
+
+		return nil, err
 	}
 
-	return nil, err
+	m.lockChannel = c
+	return m.invoke, nil
 }
 
 // invoke is a state that invokes the work function.
 func (m *fsm) invoke() (state, error) {
+	// ctx is passed to fn. It is canceled when the invoke state is exited.
 	ctx, cancel := context.WithCancel(m.ctx)
 	done := make(chan struct{})
 
@@ -134,57 +182,60 @@ func (m *fsm) invoke() (state, error) {
 		m.fn(ctx)
 	}()
 
-	// always wait for fn to return before transitioning state
 	defer func() {
-		cancel()
-		<-done
+		cancel() // if we exit this state for any reason cancel fn's ctx.
+		<-done   // always block until fn returns
 	}()
 
 	for {
 		select {
 		case <-m.ctx.Done():
+			// If the parent ctx is canceled while fn is executing, we exit and
+			// rely on the defer above to until block until fn actually responds
+			// to the cancelation by returning.
 			return nil, m.ctx.Err()
 
+		case <-done:
+			// Done is closed when fn returns, we return the token to the queue
+			// to notify other consumers.
+			return nil, m.token.Reject(true)
+
 		case tok, ok := <-m.tokens:
-			if ok {
-				// Any additional tokens we receive must be duplicates as we're
-				// already holding the token that granted us the lock in m.token.
-				if err := tok.Ack(false); err != nil { // false = single message
-					return nil, err
-				}
-			} else {
-				// If m.tokens is closed before m.closed becomes readable
-				// we don't want to attempt to read from it anymore, just wait
-				// for the error to appear or the context to be canceled.
-				m.tokens = nil
+			if !ok {
+				// m.tokens is closed which means the consumer has stopped.
+				// This is always unexpected and so must be caused by the
+				// channel closing.
+				return m.waitClose, nil
 			}
 
-		case <-done:
-			return nil, nil
-
-		case err := <-m.done:
-			return nil, err
+			// If we receive a token it must be a duplicate because the "real"
+			// token is held in m.token, we ack them to remove them from the
+			// queue permantently.
+			if err := tok.Ack(false); err != nil { // false = single message
+				return nil, err
+			}
 		}
 	}
 }
 
-func (m *fsm) declare() error {
-	_, err := m.tc.QueueDeclare(
-		m.res+".lock",
-		false, // durable,
-		false, // auto-delete
-		false, // exclusive
-		false, // no-wait
-		nil,   // args
-	)
-	if err != nil {
-		return err
+// waitClose is a state that waits for m.channel to close and returns the
+// associated error. It is entered after any unexpected AMQP failure.
+func (m *fsm) waitClose() (state, error) {
+	select {
+	case <-m.ctx.Done():
+		return nil, m.ctx.Err()
+	case err := <-m.closed:
+		return nil, err
 	}
+}
 
-	q, err := m.tc.QueueDeclare(
-		m.res+".tokens",
+func (m *fsm) consume() error {
+	queue := tokenQueue(m.res)
+
+	q, err := m.channel.QueueDeclare(
+		queue,
 		false, // durable,
-		false, // auto-delete
+		true,  // auto-delete
 		false, // exclusive
 		false, // no-wait
 		amqp.Table{
@@ -203,9 +254,9 @@ func (m *fsm) declare() error {
 	// *MIGHT* be the first locker interested in this resource, publish a new
 	// token message. Again, this just prevents some unnecessary network traffic.
 	if q.Consumers == 0 && q.Messages == 0 {
-		err = m.tc.Publish(
+		err = m.channel.Publish(
 			"",
-			m.res+".tokens",
+			queue,
 			false, // mandatory
 			false, // immediate
 			amqp.Publishing{},
@@ -215,9 +266,9 @@ func (m *fsm) declare() error {
 		}
 	}
 
-	m.tokens, err = m.tc.Consume(
-		m.res+".tokens",
-		m.res,
+	m.tokens, err = m.channel.Consume(
+		queue,
+		m.res, // consumer-tag
 		false, // autoAck
 		false, // exclusive
 		false, // noLocal
@@ -229,4 +280,14 @@ func (m *fsm) declare() error {
 	}
 
 	return err
+}
+
+// lockQueue returns the name of the lock queue to use for the resource named r.
+func lockQueue(r string) string {
+	return r + ".lock"
+}
+
+// tokenQueue returns the name of the token queue to use for the resource named r.
+func tokenQueue(r string) string {
+	return r + ".tokens"
 }

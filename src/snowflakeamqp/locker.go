@@ -51,7 +51,7 @@ func (l *Locker) Do(ctx context.Context, r string, fn func(c context.Context)) e
 			fn:     fn,
 		}
 
-		return m.run()
+		return m.execute()
 	}
 }
 

@@ -1,6 +1,10 @@
-hash: 2dfcb9797d7b09e5c51198cc3109335d045bc835649e113b1e87cc54a2807955
-updated: 2018-02-12T12:17:59.425669859+10:00
+hash: 330d51008fd3f80d3a8e95c718d53494337fcd4d71f9a0910f49e4cd64c9ec2e
+updated: 2018-02-13T07:44:13.441278749+10:00
 imports:
 - name: github.com/streadway/amqp
   version: fc7fda2371f5327ad39211e09482845b8734cc72
+- name: github.com/uber-go/multierr
+  version: 3c4937480c32f4c13a875a1829af76c98ca3d40a
+- name: go.uber.org/atomic
+  version: 8474b86a5a6f79c443ce4b2992817ff32cf208b8
 testImports: []
