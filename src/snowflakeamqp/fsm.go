@@ -13,7 +13,7 @@ type fsm struct {
 	broker *amqp.Connection
 	ctx    context.Context
 	res    string
-	fn     func(context.Context) error
+	fn     func(context.Context)
 
 	lc, tc *amqp.Channel
 	done   chan *amqp.Error
@@ -135,9 +135,10 @@ func (m *fsm) invoke() (state, error) {
 	ctx, cancel := context.WithCancel(m.ctx)
 	defer cancel()
 
-	result := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
-		result <- m.fn(ctx)
+		defer close(done)
+		m.fn(ctx)
 	}()
 
 	for {
@@ -161,8 +162,8 @@ func (m *fsm) invoke() (state, error) {
 				m.tokens = nil
 			}
 
-		case err := <-result:
-			return nil, err
+		case <-done:
+			return nil, nil
 
 		case err := <-m.done:
 			return nil, err

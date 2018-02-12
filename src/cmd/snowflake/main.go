@@ -6,27 +6,24 @@ import (
 	"time"
 
 	"github.com/jmalloc/snowflake/src/snowflakeamqp"
-	"github.com/streadway/amqp"
 )
 
 func main() {
-	broker, err := amqp.Dial("amqp://localhost")
-	if err != nil {
-		panic(err)
-	}
+	locker := &snowflakeamqp.Locker{}
 
-	locker := &snowflakeamqp.Locker{Broker: broker}
 	ctx := context.Background()
 
+	go locker.Run(ctx)
+
 	for {
-		err = locker.Do(ctx, "foo", func(ctx context.Context) error {
+		err := locker.Do(ctx, "foo", func(ctx context.Context) {
 			fmt.Println("WORK")
 
 			select {
 			case <-time.After(10 * time.Second):
-				return nil
+				return
 			case <-ctx.Done():
-				return ctx.Err()
+				return
 			}
 		})
 
