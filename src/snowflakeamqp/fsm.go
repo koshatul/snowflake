@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/streadway/amqp"
-	"github.com/uber-go/multierr"
+	"go.uber.org/multierr"
 )
 
 type state func() (state, error)
